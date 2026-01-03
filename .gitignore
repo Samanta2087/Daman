@@ -1,4 +1,4 @@
-# Environment variables
+# Environment variables (SENSITIVE)
 .env
 
 # Python cache
@@ -12,17 +12,9 @@ venv/
 env/
 ENV/
 
-# Telegram session files
+# Telegram session files (SENSITIVE)
 *.session
 *.session-journal
-
-# Data files
-*.csv
-*.json
-*.txt
-
-# Sticker files
-*.webp
 
 # IDE
 .vscode/

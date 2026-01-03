@@ -1,0 +1,7 @@
+requests
+urllib3
+pandas
+numpy
+scikit-learn
+telethon
+python-dotenv
