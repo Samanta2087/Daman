@@ -16,6 +16,12 @@ ENV/
 *.session
 *.session-journal
 
+# Database files
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
 # IDE
 .vscode/
 .idea/

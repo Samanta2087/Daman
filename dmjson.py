@@ -2,7 +2,7 @@ import time
 import requests
 import urllib3
 import os
-import csv
+import sqlite3
 import json
 import random
 import asyncio
@@ -53,7 +53,7 @@ HEADERS = {
 PARAMS = {"no": 1, "size": 10, "language": "en"}
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-DATA_FILE = "wingo_history.csv"
+DB_FILE = "wingo_history.db"
 ACCURACY_FILE = "real_accuracy.json"
 
 # ================= GLOBAL STATE =================
@@ -94,29 +94,56 @@ def check_posting_status():
             return False, f"⏳ AUTO OFF (Wait: {system_state['start_time']})"
     return False, "UNKNOWN"
 
-def init_csv():
-    if not os.path.exists(DATA_FILE) or os.path.getsize(DATA_FILE) == 0:
-        with open(DATA_FILE, "w", newline="") as f:
-            csv.writer(f).writerow(["period", "number", "size", "color", "time"])
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS wingo_history (
+            period TEXT PRIMARY KEY,
+            number INTEGER,
+            size TEXT,
+            color TEXT,
+            time TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-def save_to_csv(data_list):
+def save_to_db(data_list):
     if not data_list: return
     try:
-        new_df = pd.DataFrame(data_list)
-        if os.path.exists(DATA_FILE) and os.path.getsize(DATA_FILE) > 0:
-            old_df = pd.read_csv(DATA_FILE)
-            old_df['period'] = old_df['period'].astype(str)
-            new_df['period'] = new_df['period'].astype(str)
-            combined_df = pd.concat([old_df, new_df]).drop_duplicates(subset=['period'], keep='last')
-        else:
-            combined_df = new_df
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
         
-        # Keep 2000 records
-        if len(combined_df) > 2000:
-            combined_df = combined_df.tail(2000)
-            
-        combined_df.to_csv(DATA_FILE, index=False)
+        for data in data_list:
+            cursor.execute('''
+                INSERT OR REPLACE INTO wingo_history (period, number, size, color, time)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (data['period'], data['number'], data['size'], data['color'], data['time']))
+        
+        # Keep only last 2000 records
+        cursor.execute('SELECT COUNT(*) FROM wingo_history')
+        count = cursor.fetchone()[0]
+        if count > 2000:
+            cursor.execute('''
+                DELETE FROM wingo_history WHERE period IN (
+                    SELECT period FROM wingo_history ORDER BY period ASC LIMIT ?
+                )
+            ''', (count - 2000,))
+        
+        conn.commit()
+        conn.close()
     except: pass
+
+def read_from_db():
+    """Read all data from database as DataFrame"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        df = pd.read_sql_query('SELECT * FROM wingo_history ORDER BY period', conn)
+        conn.close()
+        return df
+    except:
+        return pd.DataFrame(columns=['period', 'number', 'size', 'color', 'time'])
 
 def get_color(n):
     if n in (0, 5): return "🟣 Violet"
@@ -177,7 +204,7 @@ def warm_up_system():
 
     if collected_data:
         collected_data.reverse()
-        save_to_csv(collected_data)
+        save_to_db(collected_data)
         print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Brain Loaded! Total Database: {len(collected_data)}")
 
 # ================= 🧠 AGGRESSIVE INTELLIGENCE =================
@@ -238,9 +265,9 @@ def logic_streak_master(df):
     return None, 0
 
 def train_and_predict_gbm():
-    if not os.path.exists(DATA_FILE) or os.path.getsize(DATA_FILE) == 0: return None, 0
     try:
-        df = pd.read_csv(DATA_FILE)
+        df = read_from_db()
+        if len(df) == 0: return None, 0
         if len(df) < 20: return None, 0 # Reduced requirement
         
         df['target'] = df['size'].apply(lambda x: 1 if x == 'Big' else 0)
@@ -386,7 +413,7 @@ async def input_handler(event):
 
 async def game_loop():
     log("🚀 Aggressive Bot Started (No Waiting)...")
-    init_csv()
+    init_db()
     warm_up_system()
     
     last_period = None
@@ -423,12 +450,12 @@ async def game_loop():
                 if last_prediction and last_period:
                     acc_data = update_accuracy(size, last_prediction, acc_data)
                 
-                save_to_csv([{
+                save_to_db([{
                     "period": period, "number": number, "size": size, 
                     "color": color, "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }])
 
-                df = pd.read_csv(DATA_FILE)
+                df = read_from_db()
                 
                 # --- INTELLIGENCE ---
                 hist_pred, hist_conf = logic_historical_probability(df)
