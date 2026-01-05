@@ -66,7 +66,8 @@ system_state = {
     "active_channel_name": list(CHANNELS.keys())[0],
     "active_channel_link": list(CHANNELS.values())[0],
     "last_channel_bet": None,
-    "consecutive_losses": 0
+    "consecutive_losses": 0,
+    "stopped_by_losses": False
 }
 
 # ================= HELPER FUNCTIONS =================
@@ -253,6 +254,8 @@ async def handler(event):
     
     if data == b'force_start':
         system_state["mode"] = "manual_on"
+        system_state["stopped_by_losses"] = False
+        system_state["consecutive_losses"] = 0
         await event.answer("🟢 Force Started!", alert=True)
 
     elif data == b'force_stop':
@@ -263,6 +266,8 @@ async def handler(event):
         if not system_state["start_time"]: await event.answer("⚠️ Set Time First!", alert=True)
         else:
             system_state["mode"] = "auto_time"
+            system_state["stopped_by_losses"] = False
+            system_state["consecutive_losses"] = 0
             await event.answer("⏰ Auto Mode ON", alert=True)
 
     elif data == b'select_channel':
@@ -390,6 +395,11 @@ async def game_loop():
                 should_post, status_msg = check_posting_status()
                 target_channel = system_state["active_channel_link"]
 
+                # Check if stopped by losses
+                if system_state["stopped_by_losses"]:
+                    status_msg = "🛑 STOPPED (4 Losses)"
+                    should_post = False
+
                 # Admin Log
                 try:
                     await bot.send_message(ADMIN_ID, f"🎰 {system_state['game_name']} | {status_msg}\n🔢 {period[-3:]} | {number} ({size})\n🤖 Pred: <b>{final_pred}</b> ({round(final_conf)}%)\n🧠 {final_logic}", parse_mode='html')
@@ -426,15 +436,15 @@ async def game_loop():
                     if system_state["consecutive_losses"] >= 4:
                         bad_series_msg = (
                             f"⚠️ <b>Very Bad Series</b> ⚠️\n\n"
-                            f"🛑 <b>Wait For Next Prediction</b>\n\n"
-                            f"We will come back stronger! 💪"
+                            f"🛑 <b>Predictions Stopped</b>\n\n"
+                            f"Please restart bot manually to continue! 💪"
                         )
                         try:
                             await userbot.send_message(target_channel, bad_series_msg, parse_mode='html')
-                            log("🛑 4 Losses - Stopping predictions")
+                            log("🛑 4 Losses - Stopping all predictions until manual restart")
                         except: pass
                         system_state["last_channel_bet"] = None
-                        system_state["consecutive_losses"] = 0  # Reset for next cycle
+                        system_state["stopped_by_losses"] = True  # Stop until manual restart
                     else:
                         # Send Next Prediction
                         next_p = str(int(period)+1)
