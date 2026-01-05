@@ -9,7 +9,6 @@ import asyncio
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from sklearn.ensemble import GradientBoostingClassifier
 from telethon import TelegramClient, events, Button
 from dotenv import load_dotenv
 
@@ -34,8 +33,8 @@ CHANNELS = {
 }
 SESSION_NAME = 'wingo_aggressive_bot'
 
-# 4. STICKER SETUP
-WIN_STICKER_FILE = "win.webp" 
+# 4. STICKER SETUP (3 win images for random selection)
+WIN_STICKERS = ["win1.webp", "win2.webp", "win3.webp"] 
 
 # ================= GAME CONFIG =================
 API_PATH = "/WinGo/WinGo_1M/GetHistoryIssuePage.json"
@@ -66,7 +65,8 @@ system_state = {
     "game_name": "BDG",
     "active_channel_name": list(CHANNELS.keys())[0],
     "active_channel_link": list(CHANNELS.values())[0],
-    "last_channel_bet": None
+    "last_channel_bet": None,
+    "consecutive_losses": 0
 }
 
 # ================= HELPER FUNCTIONS =================
@@ -207,90 +207,13 @@ def warm_up_system():
         save_to_db(collected_data)
         print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Brain Loaded! Total Database: {len(collected_data)}")
 
-# ================= 🧠 AGGRESSIVE INTELLIGENCE =================
+# ================= 🎯 SIMPLE TREND FOLLOWING =================
 
-def logic_historical_probability(df):
+def simple_trend_follow(last_size):
     """
-    Relaxed Constraints: Returns prediction even if confidence is > 50%
+    Simple Logic: If last was Big -> predict Big, if Small -> predict Small
     """
-    history_sizes = df['size'].tolist()
-    if len(history_sizes) < 10: return None, 0
-    
-    current_pattern = history_sizes[-3:] # Reduced pattern size to 3 for more matches
-    
-    big_next_count = 0
-    small_next_count = 0
-    
-    search_start_index = max(0, len(history_sizes) - 500)
-    
-    for i in range(search_start_index, len(history_sizes) - 4):
-        window = history_sizes[i : i+3]
-        if window == current_pattern:
-            next_val = history_sizes[i+3]
-            if next_val == 'Big': big_next_count += 1
-            elif next_val == 'Small': small_next_count += 1
-            
-    total = big_next_count + small_next_count
-    if total > 0:
-        big_prob = (big_next_count / total) * 100
-        small_prob = (small_next_count / total) * 100
-        
-        # Aggressive: 50% এর বেশি হলেই প্রেডিকশন দাও
-        if big_prob > small_prob: return "Big", big_prob
-        elif small_prob > big_prob: return "Small", small_prob
-        
-    return None, 0
-
-def logic_streak_master(df):
-    history_sizes = df['size'].tolist()
-    if len(history_sizes) < 5: return None, 0
-    
-    # Common Patterns
-    last_3 = history_sizes[-3:]
-    last_2 = history_sizes[-2:]
-    
-    # 3 Streak
-    if last_3 == ['Big', 'Big', 'Big']: return "Big", 85.0
-    if last_3 == ['Small', 'Small', 'Small']: return "Small", 85.0
-    
-    # 2-2 Pattern
-    last_4 = history_sizes[-4:]
-    if last_4 == ['Big', 'Big', 'Small', 'Small']: return "Big", 75.0
-    if last_4 == ['Small', 'Small', 'Big', 'Big']: return "Small", 75.0
-    
-    # ZigZag (B S B -> S)
-    if last_3 == ['Big', 'Small', 'Big']: return "Small", 70.0
-    if last_3 == ['Small', 'Big', 'Small']: return "Big", 70.0
-
-    return None, 0
-
-def train_and_predict_gbm():
-    try:
-        df = read_from_db()
-        if len(df) == 0: return None, 0
-        if len(df) < 20: return None, 0 # Reduced requirement
-        
-        df['target'] = df['size'].apply(lambda x: 1 if x == 'Big' else 0)
-        # Reduced Lags for faster adaptation
-        for i in range(1, 4): df[f'lag_{i}'] = df['target'].shift(i)
-        
-        df = df.dropna()
-        X = df[[f'lag_{i}' for i in range(1,4)]]
-        y = df['target']
-        
-        # Simplified Model for Aggression
-        model = GradientBoostingClassifier(n_estimators=50, learning_rate=0.2, max_depth=2, random_state=42)
-        model.fit(X, y)
-        
-        last_row = df.iloc[-1]
-        input_data = {f'lag_{i}': last_row[f'lag_{i-1}'] if i>1 else last_row['target'] for i in range(1,4)}
-        current_input = pd.DataFrame([input_data])
-        
-        predicted_class = model.predict(current_input)[0]
-        confidence = max(model.predict_proba(current_input)[0]) * 100
-        
-        return ("Big" if predicted_class == 1 else "Small"), round(confidence, 2)
-    except: return None, 0
+    return last_size, 75.0
 
 # ================= TELETHON CLIENTS =================
 
@@ -455,35 +378,9 @@ async def game_loop():
                     "color": color, "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }])
 
-                df = read_from_db()
-                
-                # --- INTELLIGENCE ---
-                hist_pred, hist_conf = logic_historical_probability(df)
-                streak_pred, streak_conf = logic_streak_master(df)
-                ml_pred, ml_conf = train_and_predict_gbm()
-
-                final_pred = "Waiting..."
-                final_logic = "Insufficient Data"
-                final_conf = 0
-
-                # ⚠️ AGGRESSIVE DECISION MAKING
-                
-                # 1. High Confidence Check
-                if streak_pred: 
-                    final_pred, final_conf, final_logic = streak_pred, streak_conf, "🐉 Dragon Streak"
-                elif hist_pred and hist_conf > 55: # Lowered threshold
-                    final_pred, final_conf, final_logic = hist_pred, hist_conf, "📜 History Pattern"
-                elif ml_pred:
-                    final_pred, final_conf, final_logic = ml_pred, ml_conf, "🤖 AI Prediction"
-                
-                # 2. LAST RESORT (If all above fail or are waiting)
-                if final_pred == "Waiting...":
-                    # Simple Trend Follow: Last was Big -> Predict Big
-                    final_pred = size 
-                    final_conf = 51.0
-                    final_logic = "⚠️ Blind Trend Follow"
-
-                if final_conf > 99: final_conf = 99
+                # --- SIMPLE TREND FOLLOWING ---
+                final_pred, final_conf = simple_trend_follow(size)
+                final_logic = "📈 Trend Following"
                 
                 last_prediction = final_pred
                 real_win_rate = 0
@@ -499,12 +396,17 @@ async def game_loop():
                 except: pass
 
                 if should_post:
-                    # Win Logic
+                    # Win/Loss Logic
                     last_bet = system_state["last_channel_bet"]
                     if last_bet and last_bet["period"] == period:
                         if last_bet["pick"] == size:
-                            if os.path.exists(WIN_STICKER_FILE):
-                                try: await userbot.send_file(target_channel, WIN_STICKER_FILE)
+                            # WIN - Reset loss counter
+                            system_state["consecutive_losses"] = 0
+                            
+                            # Send random win sticker
+                            win_sticker = random.choice(WIN_STICKERS)
+                            if os.path.exists(win_sticker):
+                                try: await userbot.send_file(target_channel, win_sticker)
                                 except: pass
                             else:
                                 win_msg = (
@@ -515,19 +417,37 @@ async def game_loop():
                                 )
                                 try: await userbot.send_message(target_channel, win_msg, parse_mode='html')
                                 except: pass
+                        else:
+                            # LOSS - Increment loss counter
+                            system_state["consecutive_losses"] += 1
+                            log(f"❌ Loss {system_state['consecutive_losses']}/4")
                     
-                    # Next Prediction
-                    next_p = str(int(period)+1)
-                    msg_channel = (
-                        f"✅ <b>{system_state['game_name']}</b> - ( WINGO 1MIN )\n\n"
-                        f"💰 <b>PERIOD NO. - {next_p[-3:]}</b>\n\n"
-                        f"💰 <b>BET - {final_pred.upper()}</b>"
-                    )
-                    try:
-                        await userbot.send_message(target_channel, msg_channel, parse_mode='html')
-                        log(f"🚀 Sent to Channel: {final_pred}")
-                        system_state["last_channel_bet"] = {"period": next_p, "pick": final_pred}
-                    except Exception as e: log(f"⚠️ Channel Error: {e}")
+                    # Check if 4 losses in a row
+                    if system_state["consecutive_losses"] >= 4:
+                        bad_series_msg = (
+                            f"⚠️ <b>Very Bad Series</b> ⚠️\n\n"
+                            f"🛑 <b>Wait For Next Prediction</b>\n\n"
+                            f"We will come back stronger! 💪"
+                        )
+                        try:
+                            await userbot.send_message(target_channel, bad_series_msg, parse_mode='html')
+                            log("🛑 4 Losses - Stopping predictions")
+                        except: pass
+                        system_state["last_channel_bet"] = None
+                        system_state["consecutive_losses"] = 0  # Reset for next cycle
+                    else:
+                        # Send Next Prediction
+                        next_p = str(int(period)+1)
+                        msg_channel = (
+                            f"✅ <b>{system_state['game_name']}</b> - ( WINGO 1MIN )\n\n"
+                            f"💰 <b>PERIOD NO. - {next_p[-3:]}</b>\n\n"
+                            f"💰 <b>BET - {final_pred.upper()}</b>"
+                        )
+                        try:
+                            await userbot.send_message(target_channel, msg_channel, parse_mode='html')
+                            log(f"🚀 Sent to Channel: {final_pred}")
+                            system_state["last_channel_bet"] = {"period": next_p, "pick": final_pred}
+                        except Exception as e: log(f"⚠️ Channel Error: {e}")
                 else:
                     system_state["last_channel_bet"] = None
 
