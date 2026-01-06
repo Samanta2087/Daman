@@ -436,8 +436,7 @@ async def game_loop():
                     if system_state["consecutive_losses"] >= 4:
                         bad_series_msg = (
                             f"⚠️ <b>Very Bad Series</b> ⚠️\n\n"
-                            f"🛑 <b>Predictions Stopped</b>\n\n"
-                            f"Please restart bot manually to continue! 💪"
+                            f"🛑 <b>Wait For Next Prediction</b>"
                         )
                         try:
                             await userbot.send_message(target_channel, bad_series_msg, parse_mode='html')
