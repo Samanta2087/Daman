@@ -34,7 +34,8 @@ CHANNELS = {
 SESSION_NAME = 'wingo_aggressive_bot'
 
 # 4. STICKER SETUP (3 win images for random selection)
-WIN_STICKERS = ["win1.webp", "win2.webp", "win3.webp"] 
+WIN_STICKERS = ["win1.webp", "win2.webp", "win3.webp"]
+PREDICTION_END_IMAGE = "Predaction End.webp" 
 
 # ================= GAME CONFIG =================
 API_PATH = "/WinGo/WinGo_1M/GetHistoryIssuePage.json"
@@ -54,6 +55,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 DB_FILE = "wingo_history.db"
 ACCURACY_FILE = "real_accuracy.json"
+SCHEDULE_FILE = "daily_schedule.json"
+ANNOUNCEMENT_FILE = "daily_announcements.json"
 
 # ================= GLOBAL STATE =================
 system_state = {
@@ -62,12 +65,16 @@ system_state = {
     "end_time": None,
     "waiting_for_input": False,
     "waiting_for_name": False,
+    "waiting_for_manual_schedule": False,
+    "waiting_for_announcement": False,
     "game_name": "BDG",
     "active_channel_name": list(CHANNELS.keys())[0],
     "active_channel_link": list(CHANNELS.values())[0],
     "last_channel_bet": None,
     "consecutive_losses": 0,
-    "stopped_by_losses": False
+    "stopped_by_losses": False,
+    "daily_schedules": [],
+    "daily_announcements": []
 }
 
 # ================= HELPER FUNCTIONS =================
@@ -173,6 +180,71 @@ def update_accuracy(real_result, predicted_result, acc_data):
     save_accuracy(acc_data)
     return acc_data
 
+def load_daily_schedules():
+    """Load daily schedules from JSON file"""
+    if os.path.exists(SCHEDULE_FILE):
+        try:
+            with open(SCHEDULE_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return []
+
+def save_daily_schedules(schedules):
+    """Save daily schedules to JSON file"""
+    try:
+        with open(SCHEDULE_FILE, "w") as f:
+            json.dump(schedules, f, indent=4)
+    except:
+        pass
+
+def load_daily_announcements():
+    """Load daily announcements from JSON file"""
+    if os.path.exists(ANNOUNCEMENT_FILE):
+        try:
+            with open(ANNOUNCEMENT_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+    return []
+
+def save_daily_announcements(announcements):
+    """Save daily announcements to JSON file"""
+    try:
+        with open(ANNOUNCEMENT_FILE, "w", encoding="utf-8") as f:
+            json.dump(announcements, f, indent=4, ensure_ascii=False)
+    except:
+        pass
+
+def check_daily_schedules():
+    """Check if current time matches any daily schedule"""
+    now = get_ist_time()
+    current_time = now.strftime("%H:%M")
+    
+    # Check for start time activation
+    for schedule in system_state["daily_schedules"]:
+        if schedule["time"] == current_time:
+            return "start", schedule
+    
+    # Check for end time deactivation
+    for schedule in system_state["daily_schedules"]:
+        if "end_time" in schedule and schedule["end_time"] == current_time:
+            return "end", schedule
+    
+    return None, None
+
+def check_daily_announcements():
+    """Check if current time matches any announcement schedule"""
+    now = get_ist_time()
+    current_time = now.strftime("%H:%M")
+    
+    announcements_to_send = []
+    for announcement in system_state["daily_announcements"]:
+        if announcement["time"] == current_time:
+            announcements_to_send.append(announcement)
+    
+    return announcements_to_send
+
 # ================= WARM UP =================
 def warm_up_system():
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔥 Warming up... Downloading 1000+ past results...")
@@ -226,11 +298,15 @@ userbot = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 async def get_panel_message():
     _, status_msg = check_posting_status()
     ist_time = get_ist_time().strftime('%H:%M:%S')
+    schedule_count = len(system_state["daily_schedules"])
+    announcement_count = len(system_state["daily_announcements"])
     msg = (
         f"🎛 <b>AGGRESSIVE AI PANEL</b>\n\n"
         f"📢 <b>Target:</b> {system_state['active_channel_name']}\n"
         f"🎮 <b>Game:</b> {system_state['game_name']}\n"
         f"📡 <b>Status:</b> {status_msg}\n"
+        f"📅 <b>Daily Schedules:</b> {schedule_count}\n"
+        f"📣 <b>Announcements:</b> {announcement_count}\n"
         f"🕒 <b>Time:</b> <code>{ist_time}</code>"
     )
     return msg
@@ -242,7 +318,9 @@ async def send_control_panel(event):
     keyboards = [
         [Button.inline("🟢 FORCE START", b'force_start'), Button.inline("🔴 FORCE STOP", b'force_stop')],
         [Button.inline("⏰ AUTO SCHEDULE", b'auto_mode'), Button.inline("📢 SELECT CHANNEL", b'select_channel')],
-        [Button.inline("🎮 CHANGE GAME NAME", b'change_game'), Button.inline("✏️ SET TIME", b'set_time')]
+        [Button.inline("🎮 CHANGE GAME NAME", b'change_game'), Button.inline("✏️ SET TIME", b'set_time')],
+        [Button.inline("🔧 SOLVE PROBLEM", b'solve_problem'), Button.inline("📅 VIEW SCHEDULES", b'view_schedules')],
+        [Button.inline("📣 ANNOUNCEMENT", b'announcement'), Button.inline("👁️ VIEW ANNOUNCEMENTS", b'view_announcements')]
     ]
     await event.respond(msg, buttons=keyboards, parse_mode='html')
 
@@ -303,13 +381,155 @@ async def handler(event):
         await event.respond("✏️ Enter Time (e.g. 19:00-19:20)", parse_mode='html')
         return
 
+    elif data == b'solve_problem':
+        system_state["waiting_for_manual_schedule"] = True
+        await event.respond(
+            "🔧 <b>SOLVE PROBLEM - Set Daily Schedule</b>\n\n"
+            "Enter in format:\n"
+            "<code>START|END|GAME</code>\n\n"
+            "Examples:\n"
+            "<code>19:30|19:50|BDG</code>\n"
+            "<code>20:15|20:45|DAMAN</code>\n\n"
+            "Or without end time:\n"
+            "<code>19:30|BDG</code>\n\n"
+            "This will run automatically every day!",
+            parse_mode='html'
+        )
+        return
+
+    elif data == b'announcement':
+        system_state["waiting_for_announcement"] = True
+        await event.respond(
+            "📣 <b>DAILY ANNOUNCEMENT</b>\n\n"
+            "Enter in format:\n"
+            "<code>TIME|MESSAGE</code>\n\n"
+            "Examples:\n"
+            "<code>19:00|🎮 Game starting in 30 minutes!</code>\n"
+            "<code>20:00|💰 Big win incoming! Join now!</code>\n\n"
+            "This will be sent automatically every day!",
+            parse_mode='html'
+        )
+        return
+
+    elif data == b'view_announcements':
+        if not system_state["daily_announcements"]:
+            await event.answer("📣 No announcements set yet!", alert=True)
+            return
+        
+        ann_msg = "📣 <b>DAILY ANNOUNCEMENTS</b>\n\n"
+        for idx, ann in enumerate(system_state["daily_announcements"], 1):
+            preview = ann['message'][:50] + "..." if len(ann['message']) > 50 else ann['message']
+            ann_msg += f"{idx}. ⏰ <code>{ann['time']}</code>\n   📝 {preview}\n\n"
+        
+        buttons = []
+        for idx, ann in enumerate(system_state["daily_announcements"]):
+            buttons.append([Button.inline(f"❌ Delete #{idx+1}", data=f"del_ann_{idx}".encode())])
+        buttons.append([Button.inline("🔙 BACK", b'back_main')])
+        
+        await event.edit(ann_msg, buttons=buttons, parse_mode='html')
+        return
+
+    elif data.startswith(b'del_ann_'):
+        try:
+            idx = int(data.decode().replace("del_ann_", ""))
+            if 0 <= idx < len(system_state["daily_announcements"]):
+                deleted = system_state["daily_announcements"].pop(idx)
+                save_daily_announcements(system_state["daily_announcements"])
+                await event.answer(f"✅ Deleted announcement at {deleted['time']}", alert=True)
+        except:
+            await event.answer("❌ Error deleting announcement", alert=True)
+        
+        # Refresh announcements view
+        if system_state["daily_announcements"]:
+            ann_msg = "📣 <b>DAILY ANNOUNCEMENTS</b>\n\n"
+            for idx, ann in enumerate(system_state["daily_announcements"], 1):
+                preview = ann['message'][:50] + "..." if len(ann['message']) > 50 else ann['message']
+                ann_msg += f"{idx}. ⏰ <code>{ann['time']}</code>\n   📝 {preview}\n\n"
+            
+            buttons = []
+            for idx, ann in enumerate(system_state["daily_announcements"]):
+                buttons.append([Button.inline(f"❌ Delete #{idx+1}", data=f"del_ann_{idx}".encode())])
+            buttons.append([Button.inline("🔙 BACK", b'back_main')])
+            
+            await event.edit(ann_msg, buttons=buttons, parse_mode='html')
+        else:
+            msg = await get_panel_message()
+            keyboards = [
+                [Button.inline("🟢 FORCE START", b'force_start'), Button.inline("🔴 FORCE STOP", b'force_stop')],
+                [Button.inline("⏰ AUTO SCHEDULE", b'auto_mode'), Button.inline("📢 SELECT CHANNEL", b'select_channel')],
+                [Button.inline("🎮 CHANGE GAME NAME", b'change_game'), Button.inline("✏️ SET TIME", b'set_time')],
+                [Button.inline("🔧 SOLVE PROBLEM", b'solve_problem'), Button.inline("📅 VIEW SCHEDULES", b'view_schedules')],
+                [Button.inline("📣 ANNOUNCEMENT", b'announcement'), Button.inline("👁️ VIEW ANNOUNCEMENTS", b'view_announcements')]
+            ]
+            await event.edit(msg, buttons=keyboards, parse_mode='html')
+        return
+
+    elif data == b'view_schedules':
+        if not system_state["daily_schedules"]:
+            await event.answer("📅 No schedules set yet!", alert=True)
+            return
+        
+        schedule_msg = "📅 <b>DAILY SCHEDULES</b>\n\n"
+        for idx, sch in enumerate(system_state["daily_schedules"], 1):
+            time_info = f"⏰ <code>{sch['time']}</code>"
+            if "end_time" in sch:
+                time_info += f" → <code>{sch['end_time']}</code>"
+            schedule_msg += f"{idx}. {time_info} | 🎮 <b>{sch['game']}</b>\n"
+        
+        buttons = []
+        for idx, sch in enumerate(system_state["daily_schedules"]):
+            buttons.append([Button.inline(f"❌ Delete #{idx+1}", data=f"del_sch_{idx}".encode())])
+        buttons.append([Button.inline("🔙 BACK", b'back_main')])
+        
+        await event.edit(schedule_msg, buttons=buttons, parse_mode='html')
+        return
+
+    elif data.startswith(b'del_sch_'):
+        try:
+            idx = int(data.decode().replace("del_sch_", ""))
+            if 0 <= idx < len(system_state["daily_schedules"]):
+                deleted = system_state["daily_schedules"].pop(idx)
+                save_daily_schedules(system_state["daily_schedules"])
+                await event.answer(f"✅ Deleted: {deleted['time']} | {deleted['game']}", alert=True)
+        except:
+            await event.answer("❌ Error deleting schedule", alert=True)
+        
+        # Refresh schedule view
+        if system_state["daily_schedules"]:
+            schedule_msg = "📅 <b>DAILY SCHEDULES</b>\n\n"
+            for idx, sch in enumerate(system_state["daily_schedules"], 1):
+                time_info = f"⏰ <code>{sch['time']}</code>"
+                if "end_time" in sch:
+                    time_info += f" → <code>{sch['end_time']}</code>"
+                schedule_msg += f"{idx}. {time_info} | 🎮 <b>{sch['game']}</b>\n"
+            
+            buttons = []
+            for idx, sch in enumerate(system_state["daily_schedules"]):
+                buttons.append([Button.inline(f"❌ Delete #{idx+1}", data=f"del_sch_{idx}".encode())])
+            buttons.append([Button.inline("🔙 BACK", b'back_main')])
+            
+            await event.edit(schedule_msg, buttons=buttons, parse_mode='html')
+        else:
+            msg = await get_panel_message()
+            keyboards = [
+                [Button.inline("🟢 FORCE START", b'force_start'), Button.inline("🔴 FORCE STOP", b'force_stop')],
+                [Button.inline("⏰ AUTO SCHEDULE", b'auto_mode'), Button.inline("📢 SELECT CHANNEL", b'select_channel')],
+                [Button.inline("🎮 CHANGE GAME NAME", b'change_game'), Button.inline("✏️ SET TIME", b'set_time')],
+                [Button.inline("🔧 SOLVE PROBLEM", b'solve_problem'), Button.inline("📅 VIEW SCHEDULES", b'view_schedules')],
+                [Button.inline("📣 ANNOUNCEMENT", b'announcement'), Button.inline("👁️ VIEW ANNOUNCEMENTS", b'view_announcements')]
+            ]
+            await event.edit(msg, buttons=keyboards, parse_mode='html')
+        return
+
     elif data == b'back_main': pass
 
     msg = await get_panel_message()
     keyboards = [
         [Button.inline("🟢 FORCE START", b'force_start'), Button.inline("🔴 FORCE STOP", b'force_stop')],
         [Button.inline("⏰ AUTO SCHEDULE", b'auto_mode'), Button.inline("📢 SELECT CHANNEL", b'select_channel')],
-        [Button.inline("🎮 CHANGE GAME NAME", b'change_game'), Button.inline("✏️ SET TIME", b'set_time')]
+        [Button.inline("🎮 CHANGE GAME NAME", b'change_game'), Button.inline("✏️ SET TIME", b'set_time')],
+        [Button.inline("🔧 SOLVE PROBLEM", b'solve_problem'), Button.inline("📅 VIEW SCHEDULES", b'view_schedules')],
+        [Button.inline("📣 ANNOUNCEMENT", b'announcement'), Button.inline("👁️ VIEW ANNOUNCEMENTS", b'view_announcements')]
     ]
     await event.edit(msg, buttons=keyboards, parse_mode='html')
 
@@ -337,6 +557,114 @@ async def input_handler(event):
         except:
             await event.reply("⚠️ Invalid Format! Use HH:MM-HH:MM")
 
+    if system_state["waiting_for_announcement"]:
+        try:
+            if '|' not in text:
+                await event.reply("⚠️ Invalid Format! Use TIME|MESSAGE")
+                return
+            
+            parts = text.split('|', 1)  # Split only on first |
+            if len(parts) != 2:
+                await event.reply("⚠️ Invalid Format! Use TIME|MESSAGE")
+                return
+            
+            time_str, message = parts
+            time_str = time_str.strip()
+            message = message.strip()
+            
+            # Validate time format
+            datetime.strptime(time_str, "%H:%M")
+            
+            if not message:
+                await event.reply("⚠️ Message cannot be empty!")
+                return
+            
+            new_announcement = {
+                "time": time_str,
+                "message": message
+            }
+            
+            system_state["daily_announcements"].append(new_announcement)
+            save_daily_announcements(system_state["daily_announcements"])
+            system_state["waiting_for_announcement"] = False
+            
+            preview = message[:100] + "..." if len(message) > 100 else message
+            await event.reply(
+                f"✅ <b>Daily Announcement Added!</b>\n\n"
+                f"⏰ Time: <code>{time_str}</code>\n"
+                f"📝 Message:\n{preview}\n\n"
+                f"This will be sent automatically every day!",
+                parse_mode='html'
+            )
+        except Exception as e:
+            await event.reply(f"⚠️ Invalid Format!\n\nExample:\n19:00|🎮 Game starting soon!")
+        return
+
+    if system_state["waiting_for_manual_schedule"]:
+        try:
+            if '|' not in text:
+                await event.reply("⚠️ Invalid Format! Use START|END|GAME or START|GAME")
+                return
+            
+            parts = text.split('|')
+            
+            if len(parts) == 2:
+                # Format: TIME|GAME (no end time)
+                time_str, game_str = parts
+                time_str = time_str.strip()
+                game_str = game_str.strip().upper()
+                
+                # Validate time format
+                datetime.strptime(time_str, "%H:%M")
+                
+                new_schedule = {
+                    "time": time_str,
+                    "game": game_str
+                }
+                
+                response_msg = (
+                    f"✅ <b>Daily Schedule Added!</b>\n\n"
+                    f"⏰ Start: <code>{time_str}</code>\n"
+                    f"🎮 Game: <b>{game_str}</b>\n\n"
+                    f"This will activate automatically every day!"
+                )
+                
+            elif len(parts) == 3:
+                # Format: START|END|GAME
+                start_time, end_time, game_str = parts
+                start_time = start_time.strip()
+                end_time = end_time.strip()
+                game_str = game_str.strip().upper()
+                
+                # Validate time formats
+                datetime.strptime(start_time, "%H:%M")
+                datetime.strptime(end_time, "%H:%M")
+                
+                new_schedule = {
+                    "time": start_time,
+                    "end_time": end_time,
+                    "game": game_str
+                }
+                
+                response_msg = (
+                    f"✅ <b>Daily Schedule Added!</b>\n\n"
+                    f"⏰ Start: <code>{start_time}</code>\n"
+                    f"🛑 End: <code>{end_time}</code>\n"
+                    f"🎮 Game: <b>{game_str}</b>\n\n"
+                    f"This will activate and deactivate automatically every day!"
+                )
+            else:
+                await event.reply("⚠️ Invalid Format! Use START|END|GAME or START|GAME")
+                return
+            
+            system_state["daily_schedules"].append(new_schedule)
+            save_daily_schedules(system_state["daily_schedules"])
+            system_state["waiting_for_manual_schedule"] = False
+            
+            await event.reply(response_msg, parse_mode='html')
+        except Exception as e:
+            await event.reply(f"⚠️ Invalid Format!\n\nExamples:\n19:30|19:50|BDG\n20:00|DAMAN")
+
 # ================= GAME LOOP =================
 
 async def game_loop():
@@ -344,12 +672,102 @@ async def game_loop():
     init_db()
     warm_up_system()
     
+    # Load daily schedules and announcements
+    system_state["daily_schedules"] = load_daily_schedules()
+    system_state["daily_announcements"] = load_daily_announcements()
+    log(f"📅 Loaded {len(system_state['daily_schedules'])} daily schedules")
+    log(f"📣 Loaded {len(system_state['daily_announcements'])} daily announcements")
+    
     last_period = None
     last_prediction = None
+    last_result = None
     acc_data = load_accuracy()
+    last_schedule_check = None
 
     while True:
         try:
+            # Check daily schedules and announcements every minute
+            current_minute = get_ist_time().strftime("%H:%M")
+            if current_minute != last_schedule_check:
+                last_schedule_check = current_minute
+                
+                # Check for announcements to send
+                announcements = check_daily_announcements()
+                target_channel = system_state["active_channel_link"]
+                for announcement in announcements:
+                    try:
+                        await userbot.send_message(target_channel, announcement['message'], parse_mode='html')
+                        log(f"📣 Sent announcement: {announcement['time']}")
+                        await bot.send_message(
+                            ADMIN_ID,
+                            f"📣 <b>ANNOUNCEMENT SENT</b>\n\n"
+                            f"⏰ Time: <code>{announcement['time']}</code>\n"
+                            f"📝 Message sent to channel!",
+                            parse_mode='html'
+                        )
+                    except Exception as e:
+                        log(f"⚠️ Announcement error: {e}")
+                
+                # Check for schedule changes
+                schedule_action, schedule = check_daily_schedules()
+                
+                if schedule_action == "start":
+                    system_state["game_name"] = schedule["game"]
+                    system_state["mode"] = "manual_on"
+                    system_state["stopped_by_losses"] = False
+                    system_state["consecutive_losses"] = 0
+                    log(f"📅 Daily Schedule Activated: {schedule['time']} | {schedule['game']}")
+                    try:
+                        end_info = f" → <code>{schedule['end_time']}</code>" if "end_time" in schedule else ""
+                        await bot.send_message(
+                            ADMIN_ID,
+                            f"📅 <b>DAILY SCHEDULE ACTIVATED</b>\n\n"
+                            f"⏰ Time: <code>{schedule['time']}</code>{end_info}\n"
+                            f"🎮 Game: <b>{schedule['game']}</b>\n\n"
+                            f"🟢 Bot is now running!",
+                            parse_mode='html'
+                        )
+                    except:
+                        pass
+                
+                elif schedule_action == "end":
+                    system_state["mode"] = "manual_off"
+                    log(f"🛑 Daily Schedule Ended: {schedule['end_time']} | {schedule['game']}")
+                    
+                    # Send PREDICTION END image to channel
+                    target_channel = system_state["active_channel_link"]
+                    if os.path.exists(PREDICTION_END_IMAGE):
+                        try:
+                            await userbot.send_file(target_channel, PREDICTION_END_IMAGE)
+                            log("📤 Sent PREDICTION END image to channel")
+                        except Exception as e:
+                            log(f"⚠️ Failed to send end image: {e}")
+                    else:
+                        # Send text message if image not found
+                        try:
+                            end_msg = (
+                                f"🛑 <b>PREDICTION END</b>\n\n"
+                                f"⏰ <b>Time: {schedule['end_time']}</b>\n\n"
+                                f"Thank you for playing!\n"
+                                f"See you next time! 👋"
+                            )
+                            await userbot.send_message(target_channel, end_msg, parse_mode='html')
+                        except:
+                            pass
+                    
+                    # Notify admin
+                    try:
+                        await bot.send_message(
+                            ADMIN_ID,
+                            f"🛑 <b>DAILY SCHEDULE ENDED</b>\n\n"
+                            f"⏰ End Time: <code>{schedule['end_time']}</code>\n"
+                            f"🎮 Game: <b>{schedule['game']}</b>\n\n"
+                            f"🔴 Bot stopped automatically!",
+                            parse_mode='html'
+                        )
+                    except:
+                        pass
+            
             data = None
             for domain in DOMAINS:
                 try:
@@ -400,10 +818,21 @@ async def game_loop():
                     status_msg = "🛑 STOPPED (4 Losses)"
                     should_post = False
 
+                # Prepare result message for admin
+                result_msg = ""
+                if last_prediction and last_result:
+                    if last_prediction == last_result:
+                        result_msg = "\n✅ <b>LAST: WIN</b>"
+                    else:
+                        result_msg = f"\n❌ <b>LAST: LOSS</b> (Pred: {last_prediction}, Got: {last_result})"
+
                 # Admin Log
                 try:
-                    await bot.send_message(ADMIN_ID, f"🎰 {system_state['game_name']} | {status_msg}\n🔢 {period[-3:]} | {number} ({size})\n🤖 Pred: <b>{final_pred}</b> ({round(final_conf)}%)\n🧠 {final_logic}", parse_mode='html')
+                    await bot.send_message(ADMIN_ID, f"🎰 {system_state['game_name']} | {status_msg}\n🔢 {period[-3:]} | {number} ({size})\n🤖 Pred: <b>{final_pred}</b> ({round(final_conf)}%)\n🧠 {final_logic}{result_msg}", parse_mode='html')
                 except: pass
+
+                # Update last result for next comparison
+                last_result = size
 
                 if should_post:
                     # Win/Loss Logic
