@@ -1,6 +1,7 @@
 import time
 import requests
 import urllib3
+import aiohttp
 import os
 import sqlite3
 import json
@@ -74,7 +75,8 @@ system_state = {
     "consecutive_losses": 0,
     "stopped_by_losses": False,
     "daily_schedules": [],
-    "daily_announcements": []
+    "daily_announcements": [],
+    "processed_periods": set()  # Track processed periods to prevent duplicates and detect gaps
 }
 
 # ================= HELPER FUNCTIONS =================
@@ -141,7 +143,8 @@ def save_to_db(data_list):
         
         conn.commit()
         conn.close()
-    except: pass
+    except Exception as e:
+        log(f"⚠️ Database save error: {e}")
 
 def read_from_db():
     """Read all data from database as DataFrame"""
@@ -150,8 +153,22 @@ def read_from_db():
         df = pd.read_sql_query('SELECT * FROM wingo_history ORDER BY period', conn)
         conn.close()
         return df
-    except:
+    except Exception as e:
+        log(f"⚠️ Database read error: {e}")
         return pd.DataFrame(columns=['period', 'number', 'size', 'color', 'time'])
+
+def get_last_processed_period():
+    """Get the last processed period from database"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('SELECT period FROM wingo_history ORDER BY period DESC LIMIT 1')
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
+    except Exception as e:
+        log(f"⚠️ Failed to get last period: {e}")
+        return None
 
 def get_color(n):
     if n in (0, 5): return "🟣 Violet"
@@ -162,13 +179,15 @@ def load_accuracy():
     if os.path.exists(ACCURACY_FILE):
         try:
             with open(ACCURACY_FILE, "r") as f: return json.load(f)
-        except: pass
+        except Exception as e:
+            log(f"⚠️ Accuracy file load error: {e}")
     return {"total_bets": 0, "wins": 0, "last_10_results": []}
 
 def save_accuracy(data):
     try:
         with open(ACCURACY_FILE, "w") as f: json.dump(data, f, indent=4)
-    except: pass
+    except Exception as e:
+        log(f"⚠️ Accuracy file save error: {e}")
 
 def update_accuracy(real_result, predicted_result, acc_data):
     if not predicted_result or predicted_result == "Waiting...": return acc_data
@@ -186,17 +205,17 @@ def load_daily_schedules():
         try:
             with open(SCHEDULE_FILE, "r") as f:
                 return json.load(f)
-        except:
-            pass
+        except Exception as e:
+            log(f"⚠️ Schedule file load error: {e}")
     return []
 
 def save_daily_schedules(schedules):
     """Save daily schedules to JSON file"""
     try:
-        with open(SCHEDULE_FILE, "w") as f:
+        with open(SCHEDULE_FILE, "w", encoding="utf-8") as f:
             json.dump(schedules, f, indent=4)
-    except:
-        pass
+    except Exception as e:
+        log(f"⚠️ Schedule file save error: {e}")
 
 def load_daily_announcements():
     """Load daily announcements from JSON file"""
@@ -204,8 +223,8 @@ def load_daily_announcements():
         try:
             with open(ANNOUNCEMENT_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except:
-            pass
+        except Exception as e:
+            log(f"⚠️ Announcement file load error: {e}")
     return []
 
 def save_daily_announcements(announcements):
@@ -213,8 +232,8 @@ def save_daily_announcements(announcements):
     try:
         with open(ANNOUNCEMENT_FILE, "w", encoding="utf-8") as f:
             json.dump(announcements, f, indent=4, ensure_ascii=False)
-    except:
-        pass
+    except Exception as e:
+        log(f"⚠️ Announcement file save error: {e}")
 
 def check_daily_schedules():
     """Check if current time matches any daily schedule"""
@@ -279,6 +298,50 @@ def warm_up_system():
         collected_data.reverse()
         save_to_db(collected_data)
         print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Brain Loaded! Total Database: {len(collected_data)}")
+
+# ================= 🎯 ASYNC API FETCHING =================
+
+async def fetch_game_data():
+    """Fetch game data using aiohttp (async, non-blocking, parallel)"""
+    async def try_domain(session, domain):
+        try:
+            params = PARAMS.copy()
+            params['ts'] = str(int(time.time() * 1000))
+            async with session.get(
+                domain + API_PATH,
+                params=params,
+                headers=HEADERS,
+                timeout=aiohttp.ClientTimeout(total=3),
+                ssl=False
+            ) as response:
+                if response.status == 200:
+                    # Read response as text first (handles wrong mime type)
+                    text = await response.text()
+                    
+                    # Manually parse JSON
+                    try:
+                        data = json.loads(text)
+                        if "data" in data and "list" in data["data"]:
+                            return data
+                    except json.JSONDecodeError as e:
+                        log(f"⚠️ JSON parse error from {domain}: {e}")
+                        return None
+        except Exception as e:
+            log(f"⚠️ Domain {domain} failed: {e}")
+            return None
+        return None
+    
+    # Try all domains in parallel
+    async with aiohttp.ClientSession() as session:
+        tasks = [try_domain(session, domain) for domain in DOMAINS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Return first successful result
+        for result in results:
+            if result and isinstance(result, dict):
+                return result
+    
+    return None
 
 # ================= 🎯 SIMPLE TREND FOLLOWING =================
 
@@ -678,7 +741,13 @@ async def game_loop():
     log(f"📅 Loaded {len(system_state['daily_schedules'])} daily schedules")
     log(f"📣 Loaded {len(system_state['daily_announcements'])} daily announcements")
     
-    last_period = None
+    # Initialize from last processed period in database
+    last_period = get_last_processed_period()
+    if last_period:
+        log(f"🔄 Resuming from last period: {last_period}")
+        system_state["processed_periods"].add(last_period)
+    else:
+        log("🆕 Starting fresh - no previous periods in database")
     last_prediction = None
     last_result = None
     acc_data = load_accuracy()
@@ -706,7 +775,7 @@ async def game_loop():
                             parse_mode='html'
                         )
                     except Exception as e:
-                        log(f"⚠️ Announcement error: {e}")
+                        log(f"⚠️ Announcement send error: {e}")
                 
                 # Check for schedule changes
                 schedule_action, schedule = check_daily_schedules()
@@ -727,8 +796,8 @@ async def game_loop():
                             f"🟢 Bot is now running!",
                             parse_mode='html'
                         )
-                    except:
-                        pass
+                    except Exception as e:
+                        log(f"⚠️ Schedule notification error: {e}")
                 
                 elif schedule_action == "end":
                     system_state["mode"] = "manual_off"
@@ -752,8 +821,8 @@ async def game_loop():
                                 f"See you next time! 👋"
                             )
                             await userbot.send_message(target_channel, end_msg, parse_mode='html')
-                        except:
-                            pass
+                        except Exception as e:
+                            log(f"⚠️ Failed to send end message: {e}")
                     
                     # Notify admin
                     try:
@@ -765,47 +834,97 @@ async def game_loop():
                             f"🔴 Bot stopped automatically!",
                             parse_mode='html'
                         )
-                    except:
-                        pass
+                    except Exception as e:
+                        log(f"⚠️ End notification error: {e}")
             
-            data = None
-            for domain in DOMAINS:
-                try:
-                    p = PARAMS.copy()
-                    p['ts'] = str(int(time.time() * 1000))
-                    r = requests.get(domain + API_PATH, params=p, headers=HEADERS, timeout=5, verify=False)
-                    if r.status_code == 200:
-                        temp = r.json()
-                        if "data" in temp and "list" in temp["data"]:
-                            data = temp
-                            break
-                except: continue
+            # Fetch data using async aiohttp (parallel, non-blocking)
+            data = await fetch_game_data()
             
             if not data:
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
                 continue
 
-            latest = data["data"]["list"][0]
-            period = str(latest["issueNumber"])
-            number = int(latest["number"])
-
-            if period != last_period:
+            # Process ALL periods from API response (not just latest)
+            all_periods = data["data"]["list"]
+            
+            # Sort periods by issue number (oldest to newest)
+            all_periods.sort(key=lambda x: int(x["issueNumber"]))
+            
+            # Determine if we're processing historical periods (catch-up mode) or live
+            is_catching_up = len([p for p in all_periods if str(p["issueNumber"]) not in system_state["processed_periods"]]) > 1
+            if is_catching_up:
+                log(f"📚 Catch-up mode: Processing {len(all_periods)} periods")
+            
+            # Process each period we haven't seen yet
+            for idx, item in enumerate(all_periods):
+                period = str(item["issueNumber"])
+                
+                # Skip if already processed
+                if period in system_state["processed_periods"]:
+                    continue
+                
+                # Check if this is the latest period (only one we should bet on)
+                is_latest_period = (idx == len(all_periods) - 1)
+                
+                # Validate period continuity
+                if last_period is not None:
+                    expected_next = str(int(last_period) + 1)
+                    period_gap = int(period) - int(last_period)
+                    
+                    if period_gap > 1:
+                        log(f"🚨 GAP DETECTED! Jumped from {last_period} to {period} (missed {period_gap - 1} periods)")
+                        try:
+                            await bot.send_message(
+                                ADMIN_ID,
+                                f"⚠️ <b>PERIOD GAP DETECTED</b>\n\n"
+                                f"Last: <code>{last_period}</code>\n"
+                                f"Current: <code>{period}</code>\n"
+                                f"Missed: <b>{period_gap - 1}</b> periods",
+                                parse_mode='html'
+                            )
+                        except Exception as e:
+                            log(f"⚠️ Gap notification error: {e}")
+                    elif period_gap < 1:
+                        log(f"⚠️ Duplicate or out-of-order period: {period} (last was {last_period})")
+                        continue  # Skip duplicate
+                
+                number = int(item["number"])
                 size = 'Big' if number >= 5 else 'Small'
                 color = get_color(number)
 
-                if last_prediction and last_period:
-                    acc_data = update_accuracy(size, last_prediction, acc_data)
+                # Update accuracy ONLY if we had made a prediction for THIS specific period
+                # (not for historical catch-up periods)
+                if not is_catching_up and last_prediction and last_period:
+                    # We're in live mode and had a previous prediction
+                    previous_period_num = int(last_period)
+                    current_period_num = int(period)
+                    
+                    # Only update accuracy if this period immediately follows our last prediction
+                    if current_period_num == previous_period_num + 1:
+                        acc_data = update_accuracy(size, last_prediction, acc_data)
+                        log(f"📊 Accuracy updated: Predicted {last_prediction}, Got {size}")
                 
                 save_to_db([{
                     "period": period, "number": number, "size": size, 
                     "color": color, "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }])
 
-                # --- SIMPLE TREND FOLLOWING ---
-                final_pred, final_conf = simple_trend_follow(size)
-                final_logic = "📈 Trend Following"
+                # --- PREDICTION LOGIC ---
+                # Only make predictions for the LATEST period (live mode)
+                # Skip predictions for historical catch-up periods
+                if is_latest_period or not is_catching_up:
+                    # --- SIMPLE TREND FOLLOWING ---
+                    final_pred, final_conf = simple_trend_follow(size)
+                    final_logic = "📈 Trend Following"
+                    
+                    # Update last_prediction ONLY for live periods
+                    last_prediction = final_pred
+                else:
+                    # Historical period - don't make predictions
+                    final_pred = None
+                    final_conf = 0
+                    final_logic = "📚 Historical"
                 
-                last_prediction = final_pred
                 real_win_rate = 0
                 if acc_data["total_bets"] > 0:
                     real_win_rate = round((acc_data["wins"] / acc_data["total_bets"]) * 100, 1)
@@ -818,6 +937,31 @@ async def game_loop():
                     status_msg = "🛑 STOPPED (4 Losses)"
                     should_post = False
 
+                # --- ADMIN LOGGING ---
+                # Only send admin messages for latest period to avoid spam
+                if is_latest_period or not is_catching_up:
+                    # Prepare result message for admin
+                    result_msg = ""
+                    if last_prediction and last_result:
+                        if last_prediction == last_result:
+                            result_msg = "\n✅ <b>LAST: WIN</b>"
+                        else:
+                            result_msg = f"\n❌ <b>LAST: LOSS</b> (Pred: {last_prediction}, Got: {last_result})"
+
+                    # Admin Log
+                    if final_pred:  # Only if we made a prediction
+                        try:
+                            await bot.send_message(ADMIN_ID, f"🎰 {system_state['game_name']} | {status_msg}\n🔢 {period[-3:]} | {number} ({size})\n🤖 Pred: <b>{final_pred}</b> ({round(final_conf)}%)\n🧠 {final_logic}{result_msg}", parse_mode='html')
+                        except Exception as e:
+                            log(f"⚠️ Admin message error: {e}")
+                else:
+                    # Historical period - just log to console
+                    log(f"📚 Historical: Period {period[-3:]} | {number} ({size})")
+
+                # Update last result for next comparison (only for live periods)
+                if is_latest_period or not is_catching_up:
+                    last_result = size
+
                 # Prepare result message for admin
                 result_msg = ""
                 if last_prediction and last_result:
@@ -829,15 +973,26 @@ async def game_loop():
                 # Admin Log
                 try:
                     await bot.send_message(ADMIN_ID, f"🎰 {system_state['game_name']} | {status_msg}\n🔢 {period[-3:]} | {number} ({size})\n🤖 Pred: <b>{final_pred}</b> ({round(final_conf)}%)\n🧠 {final_logic}{result_msg}", parse_mode='html')
-                except: pass
+                except Exception as e:
+                    log(f"⚠️ Admin message error: {e}")
 
-                # Update last result for next comparison
-                last_result = size
+                    log(f"📚 Historical: Period {period[-3:]} | {number} ({size})")
 
-                if should_post:
-                    # Win/Loss Logic
+                # Update last result for next comparison (only for live periods)
+                if is_latest_period or not is_catching_up:
+                    last_result = size
+
+                # --- WIN/LOSS CHECKING & CHANNEL POSTING ---
+                # Only for LATEST period in live mode (not historical catch-up)
+                if (is_latest_period or not is_catching_up) and should_post and final_pred:
+                    # Win/Loss Logic - Check if we have a result for our previous bet
                     last_bet = system_state["last_channel_bet"]
+                    
+                    # Check if this period matches our bet
+                    # Our bet was made in previous period for THIS period
                     if last_bet and last_bet["period"] == period:
+                        log(f"📊 Checking bet result: Predicted {last_bet['pick']} for period {period}, Got {size}")
+                        log(f"📊 Checking bet result: Predicted {last_bet['pick']} for period {period}, Got {size}")
                         if last_bet["pick"] == size:
                             # WIN - Reset loss counter
                             system_state["consecutive_losses"] = 0
@@ -845,8 +1000,10 @@ async def game_loop():
                             # Send random win sticker
                             win_sticker = random.choice(WIN_STICKERS)
                             if os.path.exists(win_sticker):
-                                try: await userbot.send_file(target_channel, win_sticker)
-                                except: pass
+                                try: 
+                                    await userbot.send_file(target_channel, win_sticker)
+                                except Exception as e:
+                                    log(f"⚠️ Win sticker send error: {e}")
                             else:
                                 win_msg = (
                                     f"✅ <b>{system_state['game_name']} WIN</b>\n\n"
@@ -854,8 +1011,10 @@ async def game_loop():
                                     f"💰 <b>RESULT - {size.upper()}</b>\n"
                                     f"🔥 <b>WINNER WINNER!</b> 🏆"
                                 )
-                                try: await userbot.send_message(target_channel, win_msg, parse_mode='html')
-                                except: pass
+                                try: 
+                                    await userbot.send_message(target_channel, win_msg, parse_mode='html')
+                                except Exception as e:
+                                    log(f"⚠️ Win message send error: {e}")
                         else:
                             # LOSS - Increment loss counter
                             system_state["consecutive_losses"] += 1
@@ -870,7 +1029,8 @@ async def game_loop():
                         try:
                             await userbot.send_message(target_channel, bad_series_msg, parse_mode='html')
                             log("🛑 4 Losses - Stopping all predictions until manual restart")
-                        except: pass
+                        except Exception as e:
+                            log(f"⚠️ Bad series message error: {e}")
                         system_state["last_channel_bet"] = None
                         system_state["stopped_by_losses"] = True  # Stop until manual restart
                     else:
@@ -883,18 +1043,34 @@ async def game_loop():
                         )
                         try:
                             await userbot.send_message(target_channel, msg_channel, parse_mode='html')
-                            log(f"🚀 Sent to Channel: {final_pred}")
+                            log(f"🚀 Sent to Channel: {final_pred} for period {next_p[-3:]}")
                             system_state["last_channel_bet"] = {"period": next_p, "pick": final_pred}
-                        except Exception as e: log(f"⚠️ Channel Error: {e}")
+                        except Exception as e:
+                            log(f"⚠️ Channel send error: {e}")
                 else:
-                    system_state["last_channel_bet"] = None
-
+                    # Not posting (either historical period, or posting disabled, or no prediction)
+                    if not is_catching_up:
+                        system_state["last_channel_bet"] = None
+                
+                # Mark period as processed
+                system_state["processed_periods"].add(period)
+                
+                # Keep set size manageable (only keep last 100 periods)
+                if len(system_state["processed_periods"]) > 100:
+                    # Convert to sorted list, keep only recent 50
+                    sorted_periods = sorted(system_state["processed_periods"], key=lambda x: int(x))
+                    system_state["processed_periods"] = set(sorted_periods[-50:])
+                    log("🗑️ Cleaned processed periods cache (kept last 50)")
+                
+                # Update last processed period
                 last_period = period
-
-            await asyncio.sleep(5)
+            
+            # End of all_periods loop
+            await asyncio.sleep(2)
 
         except Exception as e:
-            await asyncio.sleep(5)
+            log(f"⚠️ Game loop error: {e}")
+            await asyncio.sleep(2)
 
 if __name__ == '__main__':
     with userbot:
