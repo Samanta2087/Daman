@@ -57,6 +57,8 @@ DB_FILE = "wingo_history.db"
 ACCURACY_FILE = "real_accuracy.json"
 SCHEDULE_FILE = "daily_schedule.json"
 ANNOUNCEMENT_FILE = "daily_announcements.json"
+PREDICTION_POSTS_FILE = "daily_prediction_posts.json"
+PREDICTION_POST_MEDIA_DIR = "prediction_post_media"
 
 # ================= GLOBAL STATE =================
 system_state = {
@@ -67,6 +69,9 @@ system_state = {
     "waiting_for_name": False,
     "waiting_for_manual_schedule": False,
     "waiting_for_announcement": False,
+    "waiting_for_prediction_post_time": False,
+    "waiting_for_prediction_post_photo": False,
+    "waiting_for_prediction_post_text": False,
     "game_name": "BDG",
     "active_channel_name": list(CHANNELS.keys())[0],
     "active_channel_link": list(CHANNELS.values())[0],
@@ -74,7 +79,9 @@ system_state = {
     "consecutive_losses": 0,
     "stopped_by_losses": False,
     "daily_schedules": [],
-    "daily_announcements": []
+    "daily_announcements": [],
+    "daily_prediction_posts": [],
+    "pending_prediction_post": {}
 }
 
 # ================= HELPER FUNCTIONS =================
@@ -180,12 +187,48 @@ def update_accuracy(real_result, predicted_result, acc_data):
     save_accuracy(acc_data)
     return acc_data
 
+def normalize_time_str(value):
+    """Convert time input to HH:MM format."""
+    return datetime.strptime(value.strip(), "%H:%M").strftime("%H:%M")
+
+def normalize_schedule_item(item):
+    try:
+        if "time" in item and item["time"]:
+            item["time"] = normalize_time_str(item["time"])
+        if "end_time" in item and item["end_time"]:
+            item["end_time"] = normalize_time_str(item["end_time"])
+    except:
+        pass
+    return item
+
+def normalize_announcement_item(item):
+    try:
+        if "time" in item and item["time"]:
+            item["time"] = normalize_time_str(item["time"])
+    except:
+        pass
+    return item
+
+def normalize_prediction_post_item(item):
+    try:
+        if "photo_paths" not in item:
+            if item.get("photo_path"):
+                item["photo_paths"] = [item["photo_path"]]
+            else:
+                item["photo_paths"] = []
+        if "time" in item and item["time"]:
+            item["time"] = normalize_time_str(item["time"])
+    except:
+        pass
+    return item
+
 def load_daily_schedules():
     """Load daily schedules from JSON file"""
     if os.path.exists(SCHEDULE_FILE):
         try:
             with open(SCHEDULE_FILE, "r") as f:
-                return json.load(f)
+                schedules = json.load(f)
+                return [normalize_schedule_item(s) for s in schedules]
         except:
             pass
     return []
@@ -203,7 +246,8 @@ def load_daily_announcements():
     if os.path.exists(ANNOUNCEMENT_FILE):
         try:
             with open(ANNOUNCEMENT_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                announcements = json.load(f)
+                return [normalize_announcement_item(a) for a in announcements]
         except:
             pass
     return []
@@ -213,6 +257,25 @@ def save_daily_announcements(announcements):
     try:
         with open(ANNOUNCEMENT_FILE, "w", encoding="utf-8") as f:
             json.dump(announcements, f, indent=4, ensure_ascii=False)
+    except:
+        pass
+
+def load_daily_prediction_posts():
+    """Load daily prediction posts from JSON file"""
+    if os.path.exists(PREDICTION_POSTS_FILE):
+        try:
+            with open(PREDICTION_POSTS_FILE, "r", encoding="utf-8") as f:
+                posts = json.load(f)
+                return [normalize_prediction_post_item(p) for p in posts]
+        except:
+            pass
+    return []
+
+def save_daily_prediction_posts(posts):
+    """Save daily prediction posts to JSON file"""
+    try:
+        with open(PREDICTION_POSTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(posts, f, indent=4, ensure_ascii=False)
     except:
         pass
 
@@ -244,6 +307,57 @@ def check_daily_announcements():
             announcements_to_send.append(announcement)
     
     return announcements_to_send
+
+def check_daily_prediction_posts():
+    """Check if current time matches any prediction post schedule"""
+    now = get_ist_time()
+    current_time = now.strftime("%H:%M")
+    today = now.strftime("%Y-%m-%d")
+
+    posts_to_send = []
+    for post in system_state["daily_prediction_posts"]:
+        if post.get("time") == current_time and post.get("last_sent_date") != today:
+            posts_to_send.append(post)
+
+    return posts_to_send
+
+async def send_prediction_post(post, target_channel):
+    """Send a daily prediction post to the target channel"""
+    photo_paths = post.get("photo_paths") or []
+    if not photo_paths and post.get("photo_path"):
+        photo_paths = [post.get("photo_path")]
+    text = post.get("text", "")
+    caption = f"<b>{text}</b>" if text else ""
+
+    existing_photos = [p for p in photo_paths if p and os.path.exists(p)]
+
+    if existing_photos:
+        if len(existing_photos) == 1:
+            await userbot.send_file(
+                target_channel,
+                existing_photos[0],
+                caption=caption if caption else None,
+                parse_mode='html'
+            )
+        else:
+            await userbot.send_file(
+                target_channel,
+                existing_photos,
+                caption=caption if caption else None,
+                parse_mode='html'
+            )
+    elif text:
+        await userbot.send_message(target_channel, caption, parse_mode='html')
+
+def get_control_buttons():
+    return [
+        [Button.inline("🟢 FORCE START", b'force_start'), Button.inline("🔴 FORCE STOP", b'force_stop')],
+        [Button.inline("⏰ AUTO SCHEDULE", b'auto_mode'), Button.inline("📢 SELECT CHANNEL", b'select_channel')],
+        [Button.inline("🎮 CHANGE GAME NAME", b'change_game'), Button.inline("✏️ SET TIME", b'set_time')],
+        [Button.inline("🔧 SOLVE PROBLEM", b'solve_problem'), Button.inline("📅 VIEW SCHEDULES", b'view_schedules')],
+        [Button.inline("📣 ANNOUNCEMENT", b'announcement'), Button.inline("👁️ VIEW ANNOUNCEMENTS", b'view_announcements')],
+        [Button.inline("🖼️ PREDACTION POST", b'prediction_post'), Button.inline("👁️ VIEW POSTS", b'view_prediction_posts')]
+    ]
 
 # ================= WARM UP =================
 def warm_up_system():
@@ -300,6 +414,7 @@ async def get_panel_message():
     ist_time = get_ist_time().strftime('%H:%M:%S')
     schedule_count = len(system_state["daily_schedules"])
     announcement_count = len(system_state["daily_announcements"])
+    prediction_post_count = len(system_state["daily_prediction_posts"])
     msg = (
         f"🎛 <b>AGGRESSIVE AI PANEL</b>\n\n"
         f"📢 <b>Target:</b> {system_state['active_channel_name']}\n"
@@ -307,6 +422,7 @@ async def get_panel_message():
         f"📡 <b>Status:</b> {status_msg}\n"
         f"📅 <b>Daily Schedules:</b> {schedule_count}\n"
         f"📣 <b>Announcements:</b> {announcement_count}\n"
+        f"🖼️ <b>Predaction Posts:</b> {prediction_post_count}\n"
         f"🕒 <b>Time:</b> <code>{ist_time}</code>"
     )
     return msg
@@ -315,14 +431,7 @@ async def get_panel_message():
 async def send_control_panel(event):
     if event.sender_id != ADMIN_ID: return
     msg = await get_panel_message()
-    keyboards = [
-        [Button.inline("🟢 FORCE START", b'force_start'), Button.inline("🔴 FORCE STOP", b'force_stop')],
-        [Button.inline("⏰ AUTO SCHEDULE", b'auto_mode'), Button.inline("📢 SELECT CHANNEL", b'select_channel')],
-        [Button.inline("🎮 CHANGE GAME NAME", b'change_game'), Button.inline("✏️ SET TIME", b'set_time')],
-        [Button.inline("🔧 SOLVE PROBLEM", b'solve_problem'), Button.inline("📅 VIEW SCHEDULES", b'view_schedules')],
-        [Button.inline("📣 ANNOUNCEMENT", b'announcement'), Button.inline("👁️ VIEW ANNOUNCEMENTS", b'view_announcements')]
-    ]
-    await event.respond(msg, buttons=keyboards, parse_mode='html')
+    await event.respond(msg, buttons=get_control_buttons(), parse_mode='html')
 
 # ... (Callback Handlers and Input Handlers Same as before) ...
 @bot.on(events.CallbackQuery)
@@ -411,6 +520,67 @@ async def handler(event):
         )
         return
 
+    elif data == b'prediction_post':
+        system_state["waiting_for_prediction_post_time"] = True
+        system_state["waiting_for_prediction_post_photo"] = False
+        system_state["waiting_for_prediction_post_text"] = False
+        system_state["pending_prediction_post"] = {}
+        await event.respond(
+            "🖼️ <b>PREDACTION POST</b>\n\n"
+            "Step 1: Send time in <code>HH:MM</code>\n"
+            "Example: <code>19:30</code>\n\n"
+            "Then I will ask for photo and last text.",
+            parse_mode='html'
+        )
+        return
+
+    elif data == b'view_prediction_posts':
+        if not system_state["daily_prediction_posts"]:
+            await event.answer("🖼️ No prediction posts set yet!", alert=True)
+            return
+
+        post_msg = "🖼️ <b>DAILY PREDACTION POSTS</b>\n\n"
+        for idx, post in enumerate(system_state["daily_prediction_posts"], 1):
+            preview = post.get("text", "")[:50] + "..." if len(post.get("text", "")) > 50 else post.get("text", "")
+            photo_count = len(post.get("photo_paths") or ([post.get("photo_path")] if post.get("photo_path") else []))
+            post_msg += f"{idx}. ⏰ <code>{post['time']}</code> | 📷 {photo_count} photo(s)\n   📝 {preview}\n\n"
+
+        buttons = []
+        for idx, post in enumerate(system_state["daily_prediction_posts"]):
+            buttons.append([Button.inline(f"❌ Delete #{idx+1}", data=f"del_pp_{idx}".encode())])
+        buttons.append([Button.inline("🔙 BACK", b'back_main')])
+
+        await event.edit(post_msg, buttons=buttons, parse_mode='html')
+        return
+
+    elif data.startswith(b'del_pp_'):
+        try:
+            idx = int(data.decode().replace("del_pp_", ""))
+            if 0 <= idx < len(system_state["daily_prediction_posts"]):
+                deleted = system_state["daily_prediction_posts"].pop(idx)
+                save_daily_prediction_posts(system_state["daily_prediction_posts"])
+                await event.answer(f"✅ Deleted prediction post at {deleted['time']}", alert=True)
+        except:
+            await event.answer("❌ Error deleting prediction post", alert=True)
+
+        if system_state["daily_prediction_posts"]:
+            post_msg = "🖼️ <b>DAILY PREDACTION POSTS</b>\n\n"
+            for idx, post in enumerate(system_state["daily_prediction_posts"], 1):
+                preview = post.get("text", "")[:50] + "..." if len(post.get("text", "")) > 50 else post.get("text", "")
+                photo_count = len(post.get("photo_paths") or ([post.get("photo_path")] if post.get("photo_path") else []))
+                post_msg += f"{idx}. ⏰ <code>{post['time']}</code> | 📷 {photo_count} photo(s)\n   📝 {preview}\n\n"
+
+            buttons = []
+            for idx, post in enumerate(system_state["daily_prediction_posts"]):
+                buttons.append([Button.inline(f"❌ Delete #{idx+1}", data=f"del_pp_{idx}".encode())])
+            buttons.append([Button.inline("🔙 BACK", b'back_main')])
+
+            await event.edit(post_msg, buttons=buttons, parse_mode='html')
+        else:
+            msg = await get_panel_message()
+            await event.edit(msg, buttons=get_control_buttons(), parse_mode='html')
+        return
+
     elif data == b'view_announcements':
         if not system_state["daily_announcements"]:
             await event.answer("📣 No announcements set yet!", alert=True)
@@ -454,14 +624,7 @@ async def handler(event):
             await event.edit(ann_msg, buttons=buttons, parse_mode='html')
         else:
             msg = await get_panel_message()
-            keyboards = [
-                [Button.inline("🟢 FORCE START", b'force_start'), Button.inline("🔴 FORCE STOP", b'force_stop')],
-                [Button.inline("⏰ AUTO SCHEDULE", b'auto_mode'), Button.inline("📢 SELECT CHANNEL", b'select_channel')],
-                [Button.inline("🎮 CHANGE GAME NAME", b'change_game'), Button.inline("✏️ SET TIME", b'set_time')],
-                [Button.inline("🔧 SOLVE PROBLEM", b'solve_problem'), Button.inline("📅 VIEW SCHEDULES", b'view_schedules')],
-                [Button.inline("📣 ANNOUNCEMENT", b'announcement'), Button.inline("👁️ VIEW ANNOUNCEMENTS", b'view_announcements')]
-            ]
-            await event.edit(msg, buttons=keyboards, parse_mode='html')
+            await event.edit(msg, buttons=get_control_buttons(), parse_mode='html')
         return
 
     elif data == b'view_schedules':
@@ -511,27 +674,13 @@ async def handler(event):
             await event.edit(schedule_msg, buttons=buttons, parse_mode='html')
         else:
             msg = await get_panel_message()
-            keyboards = [
-                [Button.inline("🟢 FORCE START", b'force_start'), Button.inline("🔴 FORCE STOP", b'force_stop')],
-                [Button.inline("⏰ AUTO SCHEDULE", b'auto_mode'), Button.inline("📢 SELECT CHANNEL", b'select_channel')],
-                [Button.inline("🎮 CHANGE GAME NAME", b'change_game'), Button.inline("✏️ SET TIME", b'set_time')],
-                [Button.inline("🔧 SOLVE PROBLEM", b'solve_problem'), Button.inline("📅 VIEW SCHEDULES", b'view_schedules')],
-                [Button.inline("📣 ANNOUNCEMENT", b'announcement'), Button.inline("👁️ VIEW ANNOUNCEMENTS", b'view_announcements')]
-            ]
-            await event.edit(msg, buttons=keyboards, parse_mode='html')
+            await event.edit(msg, buttons=get_control_buttons(), parse_mode='html')
         return
 
     elif data == b'back_main': pass
 
     msg = await get_panel_message()
-    keyboards = [
-        [Button.inline("🟢 FORCE START", b'force_start'), Button.inline("🔴 FORCE STOP", b'force_stop')],
-        [Button.inline("⏰ AUTO SCHEDULE", b'auto_mode'), Button.inline("📢 SELECT CHANNEL", b'select_channel')],
-        [Button.inline("🎮 CHANGE GAME NAME", b'change_game'), Button.inline("✏️ SET TIME", b'set_time')],
-        [Button.inline("🔧 SOLVE PROBLEM", b'solve_problem'), Button.inline("📅 VIEW SCHEDULES", b'view_schedules')],
-        [Button.inline("📣 ANNOUNCEMENT", b'announcement'), Button.inline("👁️ VIEW ANNOUNCEMENTS", b'view_announcements')]
-    ]
-    await event.edit(msg, buttons=keyboards, parse_mode='html')
+    await event.edit(msg, buttons=get_control_buttons(), parse_mode='html')
 
 @bot.on(events.NewMessage)
 async def input_handler(event):
@@ -569,7 +718,7 @@ async def input_handler(event):
                 return
             
             time_str, message = parts
-            time_str = time_str.strip()
+            time_str = normalize_time_str(time_str)
             message = message.strip()
             
             # Validate time format
@@ -600,6 +749,72 @@ async def input_handler(event):
             await event.reply(f"⚠️ Invalid Format!\n\nExample:\n19:00|🎮 Game starting soon!")
         return
 
+    if system_state["waiting_for_prediction_post_time"]:
+        try:
+            normalized_time = normalize_time_str(text)
+            system_state["pending_prediction_post"] = {"time": normalized_time, "photo_paths": [], "text": "", "last_sent_date": None}
+            system_state["waiting_for_prediction_post_time"] = False
+            system_state["waiting_for_prediction_post_photo"] = True
+            system_state["waiting_for_prediction_post_text"] = True
+            await event.reply(
+                "✅ Time saved.\n\nNow send 1 or more photos. After the last photo, send the text message.",
+                parse_mode='html'
+            )
+        except:
+            await event.reply("⚠️ Invalid Time! Use HH:MM")
+        return
+
+    if system_state["waiting_for_prediction_post_photo"]:
+        if event.photo:
+            try:
+                os.makedirs(PREDICTION_POST_MEDIA_DIR, exist_ok=True)
+                file_prefix = os.path.join(PREDICTION_POST_MEDIA_DIR, f"pred_post_{int(time.time())}_{len(system_state['pending_prediction_post'].get('photo_paths', [])) + 1}")
+                saved_path = await event.download_media(file=file_prefix)
+                photo_paths = system_state["pending_prediction_post"].setdefault("photo_paths", [])
+                photo_paths.append(saved_path)
+                await event.reply(
+                    f"✅ Photo {len(photo_paths)} saved.\n\nSend another photo or send the last text now.",
+                    parse_mode='html'
+                )
+            except Exception as e:
+                await event.reply(f"⚠️ Failed to save photo: {e}")
+            return
+
+        if not text.strip():
+            await event.reply("⚠️ Please send a photo first, then send the final text when finished.")
+            return
+
+    if system_state["waiting_for_prediction_post_text"]:
+        try:
+            post_text = text.strip()
+            if not post_text:
+                await event.reply("⚠️ Text cannot be empty!")
+                return
+
+            pending = system_state.get("pending_prediction_post", {})
+            pending["text"] = post_text
+            if not pending.get("photo_paths") and pending.get("photo_path"):
+                pending["photo_paths"] = [pending["photo_path"]]
+            pending["photo_path"] = pending.get("photo_paths", [None])[0]
+            system_state["daily_prediction_posts"].append(pending)
+            save_daily_prediction_posts(system_state["daily_prediction_posts"])
+
+            system_state["waiting_for_prediction_post_text"] = False
+            system_state["waiting_for_prediction_post_photo"] = False
+            system_state["pending_prediction_post"] = {}
+
+            await event.reply(
+                f"✅ <b>Predaction Post Added!</b>\n\n"
+                f"⏰ Time: <code>{pending['time']}</code>\n"
+                f"📷 Photo: Saved\n"
+                f"📝 Text: {post_text[:100]}{'...' if len(post_text) > 100 else ''}\n\n"
+                f"It will send automatically every day.",
+                parse_mode='html'
+            )
+        except Exception as e:
+            await event.reply(f"⚠️ Failed to save prediction post: {e}")
+        return
+
     if system_state["waiting_for_manual_schedule"]:
         try:
             if '|' not in text:
@@ -611,7 +826,7 @@ async def input_handler(event):
             if len(parts) == 2:
                 # Format: TIME|GAME (no end time)
                 time_str, game_str = parts
-                time_str = time_str.strip()
+                time_str = normalize_time_str(time_str)
                 game_str = game_str.strip().upper()
                 
                 # Validate time format
@@ -632,8 +847,8 @@ async def input_handler(event):
             elif len(parts) == 3:
                 # Format: START|END|GAME
                 start_time, end_time, game_str = parts
-                start_time = start_time.strip()
-                end_time = end_time.strip()
+                start_time = normalize_time_str(start_time)
+                end_time = normalize_time_str(end_time)
                 game_str = game_str.strip().upper()
                 
                 # Validate time formats
@@ -675,8 +890,10 @@ async def game_loop():
     # Load daily schedules and announcements
     system_state["daily_schedules"] = load_daily_schedules()
     system_state["daily_announcements"] = load_daily_announcements()
+    system_state["daily_prediction_posts"] = load_daily_prediction_posts()
     log(f"📅 Loaded {len(system_state['daily_schedules'])} daily schedules")
     log(f"📣 Loaded {len(system_state['daily_announcements'])} daily announcements")
+    log(f"🖼️ Loaded {len(system_state['daily_prediction_posts'])} daily predaction posts")
     
     last_period = None
     last_prediction = None
@@ -707,6 +924,25 @@ async def game_loop():
                         )
                     except Exception as e:
                         log(f"⚠️ Announcement error: {e}")
+
+                # Check for predaction posts to send
+                prediction_posts = check_daily_prediction_posts()
+                today = get_ist_time().strftime("%Y-%m-%d")
+                for post in prediction_posts:
+                    try:
+                        await send_prediction_post(post, target_channel)
+                        post["last_sent_date"] = today
+                        save_daily_prediction_posts(system_state["daily_prediction_posts"])
+                        log(f"🖼️ Sent predaction post: {post['time']}")
+                        await bot.send_message(
+                            ADMIN_ID,
+                            f"🖼️ <b>PREDACTION POST SENT</b>\n\n"
+                            f"⏰ Time: <code>{post['time']}</code>\n"
+                            f"📢 Sent to active channel!",
+                            parse_mode='html'
+                        )
+                    except Exception as e:
+                        log(f"⚠️ Prediction post error: {e}")
                 
                 # Check for schedule changes
                 schedule_action, schedule = check_daily_schedules()
